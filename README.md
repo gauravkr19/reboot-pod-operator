@@ -1,9 +1,27 @@
 # rebootpod-controller
-// TODO(user): Add simple overview of use/purpose
+This controller reboots the pod when TTL of the database password, fetched from Hashicorp Vault, expires. 
 
 ## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+This project is inspired from Hashicorp Vault Secret Operator(VSO) project. VaultDynamicSecret(VDS) a CR from VSO, syncs the database password to k8s Secret and upon password expiry reboots the Pod. Pod reboot is implemented by [_rolloutRestartTargets_](https://developer.hashicorp.com/vault/docs/platform/k8s/vso/api-reference#rolloutrestarttarget). The `rolloutRestartTargets` of VDS is not quaranted to work with open source vault (as confirmed by Hashicorp Support). This project implements `rolloutRestartTargets` via the CR `RebootPod` which fetches TTL from Vault every 24 hours and reboot the pods in listed in the `restartTargets` of the CR. 
 
+# CR
+The RebootPod CR
+`apiVersion: gauravkr19.dev/v1alpha1
+kind: RebootPod
+metadata:
+  labels:
+    app.kubernetes.io/name: rebootpod-controller
+    app.kubernetes.io/managed-by: kustomize
+  name: rebootpod-sample
+spec:
+  vaultEndpointDB: "database/static-creds/dev-postgres"
+  jwtRole: "rebootpod-db-postgres"
+  restartTargets:
+  - kind: Deployment
+    name: test-deploy-apps1
+  - kind: StatefulSet
+    name: test-sts-apps2`
+    
 ## Getting Started
 
 ### Prerequisites
@@ -16,7 +34,7 @@
 **Build and push your image to the location specified by `IMG`:**
 
 ```sh
-make docker-build docker-push IMG=<some-registry>/rebootpod-controller:tag
+make docker-build docker-push IMG=docker.io/gauravkr19/reboot-pod:v5
 ```
 
 **NOTE:** This image ought to be published in the personal registry you specified.
