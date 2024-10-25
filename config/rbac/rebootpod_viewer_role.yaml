@@ -1,0 +1,23 @@
+# permissions for end users to view rebootpods.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: rebootpod-controller
+    app.kubernetes.io/managed-by: kustomize
+  name: rebootpod-viewer-role
+rules:
+- apiGroups:
+  - gauravkr19.dev
+  resources:
+  - rebootpods
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - gauravkr19.dev
+  resources:
+  - rebootpods/status
+  verbs:
+  - get
