@@ -24,7 +24,7 @@ spec:
     name: test-sts-apps2
 ```
 ### Authentication with Vault
-Operator runs as Deployment and its Pod's service account authenticates via its JWT. `database/static-creds/dev-postgres` this a sensitive endpoint which returns database password along with `ttl` and `last_vault_rotation`, We make use of these fields-  `ttl` and `last_vault_rotation`, to determine the password expiry.
+Operator runs as Deployment and its Pod's service account authenticates via its JWT. `database/static-creds/dev-postgres` this a sensitive endpoint which returns database password along with `ttl` and `last_vault_rotation`, We make use of these fields-  `ttl` and `last_vault_rotation`, to determine the password expiration of the database.
 
 ## Getting Started
 
