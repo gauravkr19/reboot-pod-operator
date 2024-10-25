@@ -2,7 +2,7 @@
 This controller reboots the pod when TTL of the database password, fetched from Hashicorp Vault, expires. 
 
 ## Description
-This project is inspired from Hashicorp Vault Secret Operator(VSO) project. VaultDynamicSecret(VDS) a CR from VSO, syncs the database password to k8s Secret and upon password expiry reboots the Pod. Pod reboot is implemented by [_rolloutRestartTargets_](https://developer.hashicorp.com/vault/docs/platform/k8s/vso/api-reference#rolloutrestarttarget). The `rolloutRestartTargets` of VDS is not quaranted to work with open source vault (as confirmed by Hashicorp Support). This project implements `rolloutRestartTargets` via the CR `RebootPod` which fetches TTL from Vault every 24 hours and reboot the pods in listed in the `restartTargets` of the CR. 
+This project is inspired from Hashicorp Vault Secret Operator(VSO) project. VaultDynamicSecret(VDS) a CR from VSO, syncs the database password to k8s Secret and upon password expiry reboots the Pod. Pod reboot is implemented by [_rolloutRestartTargets_](https://developer.hashicorp.com/vault/docs/platform/k8s/vso/api-reference#rolloutrestarttarget). The `rolloutRestartTargets` of VDS is not guaranteed to work with open source vault (as confirmed by Hashicorp Support). This project implements `rolloutRestartTargets` via the CR `RebootPod` which fetches TTL from Vault every 24 hours and reboot the pods in listed in the `restartTargets` of the CR. 
 
 # CR
 The RebootPod CR
