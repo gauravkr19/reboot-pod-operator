@@ -6,7 +6,7 @@ This project is inspired from Hashicorp Vault Secret Operator(VSO) project. Vaul
 
 # CR
 The RebootPod CR
-`apiVersion: gauravkr19.dev/v1alpha1
+```apiVersion: gauravkr19.dev/v1alpha1
 kind: RebootPod
 metadata:
   labels:
@@ -20,7 +20,7 @@ spec:
   - kind: Deployment
     name: test-deploy-apps1
   - kind: StatefulSet
-    name: test-sts-apps2`
+    name: test-sts-apps2```
     
 ## Getting Started
 
