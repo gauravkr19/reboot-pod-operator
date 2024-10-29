@@ -26,6 +26,11 @@ spec:
 ### Authentication with Vault
 Operator runs as Deployment and its Pod's service account authenticates via its JWT. `database/static-creds/dev-postgres` this a sensitive endpoint which returns database password along with `ttl` and `last_vault_rotation`, We make use of these fields-  `ttl` and `last_vault_rotation`, to determine the password expiration of the database.
 
+### Version improvements
+* version-1: [Requeue intervals are dynamically adjusted based on TTL value](https://github.com/gauravkr19/reboot-pod-operator/blob/6d405f6d258ec2519ffcf3bd6957a46bb904128a/internal/controller/rebootpod_controller_test.go).
+* version-2: [Used goroutine with waitgroup](https://github.com/gauravkr19/reboot-pod-operator/blob/068b36f96e6b8dee7021fbf13527ffced3b15917/internal/controller/rebootpod_controller.go)\
+Attempted to insert sleep itervals instead of calling Vault API several times. But it missed the TTL expiry of another CR when sleeping on longer intervals. Just used goroutine with waitgroup
+
 ## Getting Started
 
 ### Prerequisites
