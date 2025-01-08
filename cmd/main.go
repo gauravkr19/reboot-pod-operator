@@ -23,6 +23,8 @@ import (
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
+
+	"k8s.io/client-go/dynamic"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -36,6 +38,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	gauravkr19devv1alpha1 "github.com/gauravkr19/reboot-pod/api/v1alpha1"
+	metrics "github.com/gauravkr19/reboot-pod/common/metrics"
 	"github.com/gauravkr19/reboot-pod/internal/controller"
 	// +kubebuilder:scaffold:imports
 )
@@ -53,6 +56,10 @@ func init() {
 }
 
 func main() {
+	vaultURL := os.Getenv("VAULT_URL")
+	authPath := os.Getenv("VAULT_AUTH_PATH")
+	useTLS := os.Getenv("USE_TLS") == "false"
+
 	var metricsAddr string
 	var enableLeaderElection bool
 	var probeAddr string
@@ -112,6 +119,12 @@ func main() {
 		TLSOpts: tlsOpts,
 	}
 
+	// register custom metrics for reboot pods
+	if err := metrics.RegisterMetrics(); err != nil {
+		setupLog.Error(err, "Failed to register custom metrics")
+		os.Exit(1)
+	}
+
 	if secureMetrics {
 		// FilterProvider is used to protect the metrics endpoint with authn/authz.
 		// These configurations ensure that only authorized users and service accounts
@@ -144,14 +157,30 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err = (&controller.RebootPodReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
+	// Initialize the dynamic client, for Informer,  using the manager's config
+	dynamicClient, err := dynamic.NewForConfig(mgr.GetConfig())
+	if err != nil {
+		setupLog.Error(err, "unable to create dynamic client")
+		os.Exit(1)
+	}
+
+	// Initialize the RebootPodReconciler with the manager
+	reconciler := controller.NewRebootPodReconciler(mgr.GetClient(), dynamicClient, mgr.GetScheme(), vaultURL, authPath, useTLS)
+
+	if err := reconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "RebootPod")
 		os.Exit(1)
 	}
-	// +kubebuilder:scaffold:builder
+
+	// if err = (&controller.RebootPodReconciler{
+	// 	Client: mgr.GetClient(),
+	// 	Scheme: mgr.GetScheme(),
+	// }).SetupWithManager(mgr); err != nil {
+	// 	setupLog.Error(err, "unable to create controller", "controller", "RebootPod")
+	// 	os.Exit(1)
+	// }
+
+	// // +kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")
