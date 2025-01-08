@@ -1,0 +1,15 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: reboot-pod-sm
+  labels:
+    release: prom
+    control-plane: controller-manager
+spec:
+  endpoints:
+  - interval: 30s
+    path: /custom_metrics
+    port: metrics
+  selector:
+    matchLabels:
+      control-plane: controller-manager

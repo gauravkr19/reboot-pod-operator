@@ -67,11 +67,13 @@ spec:
         name: manager
         env:
         - name: VaultURL
-          value: "http://172.31.96.144:8010"
+          value: "https://172.31.96.144:8010"
         - name: AuthPath
           value: "auth/jwt/login"
         - name: UseTLS
-          value: "false"
+          value: "true"
+        - name: VAULT_CACERT
+          value: "/tmp/ca.crt"
         securityContext:
           allowPrivilegeEscalation: false
           capabilities:
@@ -98,5 +100,13 @@ spec:
           requests:
             cpu: 10m
             memory: 64Mi
+        volumeMounts:
+        - name: vault-ca
+          mountPath: /tmp/
       serviceAccountName: controller-manager
       terminationGracePeriodSeconds: 10
+      volumes:
+      - name: vault-ca
+        secret:
+           secretName: vault-ca-cert
+

@@ -11,3 +11,5 @@ spec:
   restartTargets:
   - kind: Deployment
     name: test-vault-deploy
+  - kind: StatefulSet
+    name: Some-sts

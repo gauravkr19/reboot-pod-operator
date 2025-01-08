@@ -17,6 +17,7 @@ limitations under the License.
 package v1alpha1
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -41,7 +42,28 @@ type RestartTarget struct {
 
 // RebootPodStatus defines the observed state of RebootPod
 type RebootPodStatus struct {
-	LastRotationTime metav1.Time `json:"lastRotationTime,omitempty"`
+	RolloutStatus   RolloutStatus `json:"rolloutStatus,omitempty"`
+	RebootCompleted RebootState   `json:"rebootCompleted,omitempty"`
+	LastHealthCheck metav1.Time   `json:"lastHealthCheck,omitempty"`
+	VaultSyncStatus VaultSync     `json:"vaultSyncStatus,omitempty"`
+}
+
+// RolloutStatus tracks the status of a rollout
+type RolloutStatus struct {
+	State           string                   `json:"state,omitempty"` // e.g., Success/Failure/Pending
+	FailedResources []corev1.ObjectReference `json:"failedResources,omitempty"`
+}
+
+// RebootCompleted tracks the status of a rollout restart
+type RebootState struct {
+	State              bool                     `json:"state,omitempty"` // eg. true/false
+	FailedHealthChecks []corev1.ObjectReference `json:"failedHealthChecks,omitempty"`
+}
+
+// VaultSync defines the observed state of Vault synchronization
+type VaultSync struct {
+	State         string                   `json:"state,omitempty"` // Success/Failure
+	SynchedSecret []corev1.ObjectReference `json:"synchedSecret,omitempty"`
 }
 
 // +kubebuilder:object:root=true
