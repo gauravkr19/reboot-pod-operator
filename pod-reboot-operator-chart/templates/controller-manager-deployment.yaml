@@ -1,0 +1,78 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: rebootpod-controller
+    control-plane: controller-manager
+  name: {{ include "chart.fullname" . }}-controller-manager
+  namespace: {{ .Release.Namespace }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      control-plane: controller-manager
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/default-container: manager
+      creationTimestamp: null
+      labels:
+        control-plane: controller-manager
+    spec:
+      containers:
+      - args:
+        - --metrics-bind-address=:8443
+        - --leader-elect
+        - --health-probe-bind-address=:8081
+        command:
+        - /manager
+        env:
+        - name: VaultURL
+          value: {{ .Values.controller.vault.vaulturl }}
+        - name: AuthPath
+          value: {{ .Values.controller.vault.authpath }}
+        - name: UseTLS
+          value: "{{ .Values.controller.vault.useTLS }}"
+        - name: ReportingCRs
+          value: "{{ .Values.controller.vault.ReportingCRs }}"  
+        # - name: VAULT_CACERT
+        #   value: {{ .Values.controller.vault.VAULT_CACERT }}               
+        image: {{ .Values.controller.image.repository }}:{{ .Values.controller.image.tag }}
+        livenessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /healthz
+            port: 8081
+            scheme: HTTP
+          initialDelaySeconds: 15
+          periodSeconds: 20
+          successThreshold: 1
+          timeoutSeconds: 1
+        name: manager
+        readinessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /readyz
+            port: 8081
+            scheme: HTTP
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 1
+        resources:
+          limits:
+            cpu: 500m
+            memory: 128Mi
+          requests:
+            cpu: 10m
+            memory: 64Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+      securityContext:
+        runAsNonRoot: true
+      serviceAccountName: {{ include "chart.fullname" . }}-controller-manager
+
