@@ -31,6 +31,7 @@ Operator runs as Deployment and its Pod's service account authenticates via its 
 * version-2: [Used goroutine with waitgroup](https://github.com/gauravkr19/reboot-pod-operator/commit/068b36f96e6b8dee7021fbf13527ffced3b15917)\
 Attempted to insert sleep itervals instead of calling Vault API several times. But it missed the TTL expiry of another CR when sleeping on longer intervals. Just used goroutine with waitgroup
 * version-3: [Used cache to track the ttl expiration minimizing on controller requeues and call to Vault API](https://github.com/gauravkr19/reboot-pod-operator/commit/4658f8965a75c10cc3d7a371175943ab462c18e8)
+* version-4: [Used workqueue, Informer and Prometheus metrics](https://github.com/gauravkr19/reboot-pod-operator/commit/d43d3512248b520f20083fbedec56d9a8133fe10)
 
 ## Getting Started
 
