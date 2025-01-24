@@ -1,3 +1,2 @@
 resources:
 - monitor.yaml
-- operator-custom-metrics-sm.yaml

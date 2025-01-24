@@ -1,9 +1,10 @@
 resources:
 - manager.yaml
 - secret.yaml
+- service-monitor.yaml
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 images:
 - name: controller
   newName: docker.io/gauravkr19/reboot-pod
-  newTag: metrics
+  newTag: metrics-v4
