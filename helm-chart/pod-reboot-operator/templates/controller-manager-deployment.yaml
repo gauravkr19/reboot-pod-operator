@@ -36,8 +36,8 @@ spec:
           value: "{{ .Values.controller.vault.useTLS }}"
         - name: ReportingCRs
           value: "{{ .Values.controller.vault.ReportingCRs }}"  
-        # - name: VAULT_CACERT
-        #   value: {{ .Values.controller.vault.VAULT_CACERT }}               
+        - name: VAULT_CACERT
+          value: {{ .Values.controller.vault.VAULT_CACERT }}               
         image: {{ .Values.controller.image.repository }}:{{ .Values.controller.image.tag }}
         livenessProbe:
           failureThreshold: 3
@@ -67,6 +67,9 @@ spec:
           requests:
             cpu: 10m
             memory: 64Mi
+        volumeMounts:
+        - name: vault-ca
+          mountPath: /tmp/            
         securityContext:
           allowPrivilegeEscalation: false
           capabilities:
@@ -75,4 +78,7 @@ spec:
       securityContext:
         runAsNonRoot: true
       serviceAccountName: {{ include "chart.fullname" . }}-controller-manager
-
+      volumes:
+      - name: vault-ca
+        secret:
+           secretName: vault-ca-cert

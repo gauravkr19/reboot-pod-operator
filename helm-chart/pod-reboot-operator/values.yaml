@@ -1,10 +1,10 @@
 controller:
   image:
-    repository: quay-registry-quay-dev-quay-enterprise.apps.ocp-lab.menalab.corp.local/devops/reboot-pod-operator
+    repository: docker.io/gauravkr19/reboot-pod
     tag: metrics-v4
   vault:
-    vaulturl: "https://vault-ui-dev.apps.ocp2-lab.menalab.corp.local"
+    vaulturl: "https://172.31.96.144:8010"
     authpath: "auth/jwt/login"
     useTLS: true
     ReportingCRs: false
-    # VAULT_CACERT: "/tmp/ca.crt"
+    VAULT_CACERT: "/tmp/ca.crt"
