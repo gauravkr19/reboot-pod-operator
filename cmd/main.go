@@ -19,6 +19,7 @@ package main
 import (
 	"crypto/tls"
 	"flag"
+	"log"
 	"os"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
@@ -56,9 +57,9 @@ func init() {
 }
 
 func main() {
-	vaultURL := os.Getenv("VAULT_URL")
-	authPath := os.Getenv("VAULT_AUTH_PATH")
-	useTLS := os.Getenv("USE_TLS") == "false"
+	// vaultURL := os.Getenv("VAULT_URL")
+	// authPath := os.Getenv("VAULT_AUTH_PATH")
+	// useTLS := os.Getenv("USE_TLS") == "false"
 
 	var metricsAddr string
 	var enableLeaderElection bool
@@ -165,7 +166,10 @@ func main() {
 	}
 
 	// Initialize the RebootPodReconciler with the manager
-	reconciler := controller.NewRebootPodReconciler(mgr.GetClient(), dynamicClient, mgr.GetScheme(), vaultURL, authPath, useTLS)
+	reconciler, err := controller.NewRebootPodReconciler(mgr.GetClient(), dynamicClient, mgr.GetScheme())
+	if err != nil {
+		log.Fatalf("Failed to initialize RebootPodReconciler: %v", err)
+	}
 
 	if err := reconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "RebootPod")

@@ -3,8 +3,7 @@ kind: ServiceMonitor
 metadata:
   name: reboot-pod-sm
   labels:
-    release: prom
-    control-plane: controller-manager
+    release: kube-prometheus-stack
 spec:
   endpoints:
   - interval: 30s

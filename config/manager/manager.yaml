@@ -74,6 +74,8 @@ spec:
           value: "true"
         - name: VAULT_CACERT
           value: "/tmp/ca.crt"
+        - name: ReportingCRs
+          value: "false"
         securityContext:
           allowPrivilegeEscalation: false
           capabilities:

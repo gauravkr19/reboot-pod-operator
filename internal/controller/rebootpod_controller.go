@@ -66,6 +66,9 @@ type RebootPodReconciler struct {
 	ProcessedResourceVersions sync.Map                                                   // Map to track last processed ResourceVersion
 	Queue                     workqueue.TypedRateLimitingInterface[types.NamespacedName] // Work Queue for rollout-restart
 	HealthCheckQueue          workqueue.TypedRateLimitingInterface[types.NamespacedName] // work queue for health checks
+	MissingCRs                map[string]struct{}                                        // Tracks missing CRs and prevents continous logging
+	LastCacheLogTime          time.Time                                                  // Controls the frequency of cache printing in the logs
+	ReportingCRs              bool                                                       // Prints the table with CR and its attributes
 }
 
 // TTLCacheEntry stores the expiration time and last rotation for each CR.
@@ -83,7 +86,18 @@ const (
 	// ActionCheckStatus
 )
 
-func NewRebootPodReconciler(client client.Client, dynamicClient dynamic.Interface, scheme *runtime.Scheme, vaultURL, authPath string, useTLS bool) *RebootPodReconciler {
+func NewRebootPodReconciler(client client.Client, dynamicClient dynamic.Interface, scheme *runtime.Scheme) (*RebootPodReconciler, error) {
+	vaultURL := os.Getenv("VaultURL")
+	authPath := os.Getenv("AuthPath")
+	useTLS := os.Getenv("UseTLS") == "true"
+	reportingCRs := os.Getenv("ReportingCRs") == "true"
+
+	if vaultURL == "" {
+		return nil, fmt.Errorf("environment variable VaultURL is required")
+	}
+	if authPath == "" {
+		return nil, fmt.Errorf("environment variable AuthPath is required")
+	}
 	return &RebootPodReconciler{
 		Client:           client,
 		DynamicClient:    dynamicClient,
@@ -94,7 +108,8 @@ func NewRebootPodReconciler(client client.Client, dynamicClient dynamic.Interfac
 		VaultURL:         vaultURL,
 		AuthPath:         authPath,
 		UseTLS:           useTLS,
-	}
+		ReportingCRs:     reportingCRs,
+	}, nil
 }
 
 // // ANSI escape codes for colors and reset
@@ -126,8 +141,8 @@ func (r *RebootPodReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	// Update the cache with TTL and last rotation info
 	if err := r.updateCache(ctx, req.Name, req.Namespace); err != nil {
-		log.Error(err, "Failed to update cache in Reconcile", "name", req.Name, "namespace", req.Namespace)
-		return ctrl.Result{}, err
+		// log.Error(err, "Failed to update cache in Reconcile", "name", req.Name, "namespace", req.Namespace)
+		return ctrl.Result{}, nil
 	}
 
 	// Fetch the RebootPod instance
@@ -137,8 +152,8 @@ func (r *RebootPodReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			log.Info("RebootPod resource not found. Ignoring since it must be deleted.")
 			return ctrl.Result{}, nil
 		}
-		log.Error(err, "Failed to fetch RebootPod")
-		return ctrl.Result{}, err
+		log.Error(err, "Failed to fetch RebootPod", "name", req.Name, "namespace", req.Namespace)
+		return ctrl.Result{}, nil
 	}
 
 	_, _, username, password, err := r.fetchTTLFromVault(ctx, req.Name, req.Namespace)
@@ -164,13 +179,14 @@ func (r *RebootPodReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 	}
 
+	// Update sync status to .status.vaultSyncStatus.state
 	if err := r.Status().Update(ctx, &rebootPod); err != nil {
 		log.Error(err, "Failed to update RebootPod status")
 		return ctrl.Result{}, err
 	}
 
 	log.Info("Reconciled RebootPod and updated cache", "CR", req.Name)
-	return ctrl.Result{RequeueAfter: 6 * time.Hour}, nil
+	return ctrl.Result{RequeueAfter: 1 * time.Hour}, nil
 }
 
 // Create a Vault client
@@ -238,8 +254,8 @@ func (r *RebootPodReconciler) fetchTTLFromVault(ctx context.Context, name, names
 	vaultEndpointDB := rebootPod.Spec.VaultEndpointDB
 	AuthPath := os.Getenv("AuthPath")
 
-	jwtToken, err := os.ReadFile("/home/cloud_user/my-controller/unseal/jwt_token")
-	// jwtToken, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
+	// jwtToken, err := os.ReadFile("/home/cloud_user/my-controller/unseal/jwt_token")
+	jwtToken, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
 	if err != nil {
 		log.Error(err, "unable to read ServiceAccount JWT token")
 	}
@@ -251,7 +267,6 @@ func (r *RebootPodReconciler) fetchTTLFromVault(ctx context.Context, name, names
 	}
 
 	// Authenticate with Vault and set token
-	// vaultClient := createVaultClient(ctx)
 	secret, err := vaultClient.Logical().Write(AuthPath, authData)
 	if err != nil || secret.Auth == nil {
 		log.Error(err, "Vault JWT/K8s login failed")
@@ -279,7 +294,6 @@ func (r *RebootPodReconciler) fetchTTLFromVault(ctx context.Context, name, names
 	username := creds.Data["username"].(string)
 	password := creds.Data["password"].(string)
 
-	// log.Info("Fetched TTL and rotation info from Vault", "last_vault_rotation", lastRotation, "ttl", ttl)
 	return ttl, lastRotation, username, password, err
 }
 
@@ -476,18 +490,12 @@ func (r *RebootPodReconciler) enqueueResourceIfMonitored(obj interface{}, namesp
 }
 
 // checkDeploymentStatus checks the rollout status of a specific Deployment and logs.
-func (r *RebootPodReconciler) checkDeploymentStatus(ctx context.Context, deployment *appsv1.Deployment) error {
+func (r *RebootPodReconciler) checkDeploymentStatus(deployment *appsv1.Deployment) error {
 
 	if deployment.Status.UpdatedReplicas != *deployment.Spec.Replicas ||
 		deployment.Status.ReadyReplicas != *deployment.Spec.Replicas {
 		log.Log.Info("Deployment rollout is in progress", "name", deployment.Name, "namespace", deployment.Namespace)
 		return fmt.Errorf("rollout in progress")
-	}
-	kind := "Deployment"
-
-	// Log resource warnings
-	if err := r.logResourceWarnings(ctx, deployment.Name, deployment.Namespace, kind); err != nil {
-		return fmt.Errorf("failed to log resource warnings for deployment %s/%s: %w", deployment.Namespace, deployment.Name, err)
 	}
 
 	log.Log.Info("Deployment health check is complete", "deployment", deployment.Name)
@@ -495,93 +503,119 @@ func (r *RebootPodReconciler) checkDeploymentStatus(ctx context.Context, deploym
 }
 
 // Checks rollout status of statefulSet and logs
-func (r *RebootPodReconciler) checkStatefulSetStatus(ctx context.Context, statefulSet *appsv1.StatefulSet) error {
+func (r *RebootPodReconciler) checkStatefulSetStatus(statefulSet *appsv1.StatefulSet) error {
 	if statefulSet.Status.UpdatedReplicas != *statefulSet.Spec.Replicas ||
 		statefulSet.Status.ReadyReplicas != *statefulSet.Spec.Replicas {
 		return fmt.Errorf("statefulSet rollout in progress for %s in %s", statefulSet.Name, statefulSet.Namespace)
 	}
 
-	kind := "StatefulSet"
-
-	// Log resource warnings
-	if err := r.logResourceWarnings(ctx, statefulSet.Name, statefulSet.Namespace, kind); err != nil {
-		return fmt.Errorf("failed to log resource warnings for statefulSet %s/%s: %w", statefulSet.Namespace, statefulSet.Name, err)
-	}
 	log.Log.Info("StatefulSet health check is complete", "statefulSet", statefulSet.Name)
 	return nil
 }
 
-// func logResourceWarnings is a helper function which finds events related to resource issue
-func (r *RebootPodReconciler) logResourceWarnings(ctx context.Context, name string, namespace string, kind string) error {
+// func logResourceWarnings finds events related to resource issue
+func (r *RebootPodReconciler) logResourceWarnings(ctx context.Context, name string, namespace string, kind string) ([]corev1.Event, error) {
 	log := log.FromContext(ctx)
 	var eventList corev1.EventList
+	var warnings []corev1.Event
 
 	// List events in the namespace to check for warnings
 	if err := r.List(ctx, &eventList, client.InNamespace(namespace)); err != nil {
-		return fmt.Errorf("failed to list events: %w", err)
+		return nil, fmt.Errorf("failed to list events: %w", err)
 	}
 
 	for _, event := range eventList.Items {
 		if event.Type == corev1.EventTypeWarning && event.InvolvedObject.Name == name && event.InvolvedObject.Kind == kind {
 			if strings.Contains(event.Reason, "ResourceQuotaExceeded") || strings.Contains(event.Reason, "LimitRangeExceeded") {
-				log.Error(fmt.Errorf("resource limit issue"), "rollout failed due to resource constraints",
-					"name", name, "namespace", namespace, "reason", event.Reason)
-				return fmt.Errorf("rollout failed due to resource limit issue: %s", event.Reason)
+				log.Error(fmt.Errorf("resource limit issue"), "rollout failed due to resource constraints", "name", name, "namespace", namespace, "reason", event.Reason)
 			}
+			// Append warning event
+			warnings = append(warnings, event)
 		}
 	}
-	return nil
+	return warnings, nil
 }
 
-// updateCache updates cache with CR as key and few ttributes as values of the map
+// updateCache updates cache with CR as key and few attributes as values of the map
 func (r *RebootPodReconciler) updateCache(ctx context.Context, name, namespace string) error {
 	log := log.FromContext(ctx)
 
-	var rebootPod gauravkr19devv1alpha1.RebootPod
+	// Initialize Cache and MissingCRs if nil
 	if r.Cache == nil {
 		r.Cache = make(map[string]TTLCacheEntry)
 	}
+	if r.MissingCRs == nil {
+		r.MissingCRs = make(map[string]struct{})
+	}
 
-	// Retrieve the latest RebootPod object
+	key := fmt.Sprintf("%s/%s", namespace, name)
+
+	// Fetch the RebootPod CR
+	var rebootPod gauravkr19devv1alpha1.RebootPod
 	if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, &rebootPod); err != nil {
-		log.Error(err, "Failed to fetch RebootPod for cache update", "name", name, "namespace", namespace)
+		// Log and track missing CRs
+		if _, alreadyLogged := r.MissingCRs[key]; !alreadyLogged {
+			log.Error(err, fmt.Sprintf("Cache update failed, the CR %s may be deleted", name), "name", name, "namespace", namespace)
+			r.MissingCRs[key] = struct{}{}
+		}
+
+		// Remove missing CRs from cache
+		r.CacheMutex.Lock()
+		delete(r.Cache, name)
+		r.CacheMutex.Unlock()
 		return err
 	}
 
-	// Fetch TTL and last rotation from Vault
+	// Remove from MissingCRs if CR exists
+	delete(r.MissingCRs, key)
+
+	// Fetch TTL and Last Rotation from Vault
 	ttl, lastRotation, _, _, err := r.fetchTTLFromVault(ctx, name, namespace)
 	if err != nil {
 		log.Error(err, "Failed to fetch TTL from Vault")
 		return err
 	}
 
+	// Update expiration with a 400ms buffer
 	buffer := 400 * time.Millisecond
 	expiration := time.Now().Add((time.Duration(ttl) * time.Second) + buffer)
 
-	// Initialize a tabwriter with minimum width, padding, and alignment to display the cache
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', tabwriter.Debug)
-	// Print table headers
-	fmt.Fprintln(w, "CR Name\tNamespace\tTTL Expiration\tLast Rotation")
-	// header := fmt.Sprintf("%s%sCR Name\tNamespace\tExpiration\tLast Rotation%s", Bold, Blue, Reset)
-	// fmt.Fprintln(w, header)
-
-	// Update cache with TTL and last rotation info
+	// Update the cache
 	r.CacheMutex.Lock()
 	r.Cache[rebootPod.Name] = TTLCacheEntry{
 		Expiration:   expiration,
 		LastRotation: lastRotation,
 		Namespace:    rebootPod.Namespace,
 	}
-
-	for name, entry := range r.Cache {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", name, entry.Namespace, entry.Expiration.Format("2006-01-02 15:04:05"), entry.LastRotation.Format("2006-01-02 15:04:05"))
-	}
 	r.CacheMutex.Unlock()
-	fmt.Println()
-	w.Flush()
-	fmt.Println()
 
-	log.Info("Cache Updated")
+	// ReportingCRs prints cache info in table format
+	shouldLog := r.ReportingCRs || (!r.ReportingCRs && time.Since(r.LastCacheLogTime) > 7*24*time.Hour)
+	if shouldLog {
+		// Update LastCacheLogTime to log every 7th day
+		if !r.ReportingCRs && time.Since(r.LastCacheLogTime) > 7*24*time.Hour {
+			r.LastCacheLogTime = time.Now()
+		}
+
+		// ReportingCRs prints cache info in table format
+		if r.ReportingCRs {
+			// Print the cache as a human-readable table
+			w := tabwriter.NewWriter(os.Stdout, 8, 8, 3, ' ', tabwriter.AlignRight|tabwriter.Debug)
+			fmt.Fprintln(w, "CR Name \t Namespace \t TTL Expiration \t Last Rotation")
+
+			r.CacheMutex.Lock()
+			for name, entry := range r.Cache {
+				fmt.Fprintf(w, "%s \t %s \t %s \t %s\n", name, entry.Namespace, entry.Expiration.Format("2006-01-02 15:04:05"), entry.LastRotation.Format("2006-01-02 15:04:05"))
+			}
+			r.CacheMutex.Unlock()
+			fmt.Println()
+			w.Flush()
+			fmt.Println()
+		} else {
+			// Log cache info in JSON structured format
+			log.WithValues("cache", r.Cache).Info("Cache updated")
+		}
+	}
 	return nil
 }
 
@@ -704,12 +738,30 @@ func (r *RebootPodReconciler) processHealthCheckQueue(ctx context.Context, obj i
 
 	var rolloutStatus string
 	var failedHealthCheck []corev1.ObjectReference
+	var eventIssues []corev1.ObjectReference
 
 	// Determine the type of workload and fetch the resource accordingly
 	var deployment appsv1.Deployment
 	if err := r.Get(ctx, namespacedName, &deployment); err == nil {
 		log.Info("Checking Deployment status after reboot", "name", deployment.Name, "namespace", deployment.Namespace)
-		if err := r.checkDeploymentStatus(ctx, &deployment); err != nil {
+
+		// Check for resource-specific issues
+		warnings, err := r.logResourceWarnings(ctx, deployment.Name, deployment.Namespace, "Deployment")
+		if err != nil {
+			log.Error(err, "Failed to fetch warnings for Deployment", "name", deployment.Name)
+		}
+
+		for _, warning := range warnings {
+			eventIssues = append(eventIssues, corev1.ObjectReference{
+				Kind:      "Deployment",
+				Name:      deployment.Name,
+				Namespace: deployment.Namespace,
+				FieldPath: warning.Reason,
+			})
+		}
+
+		// Check Deployment status
+		if err := r.checkDeploymentStatus(&deployment); err != nil {
 			rolloutStatus = "Failure"
 			failedHealthCheck = append(failedHealthCheck, corev1.ObjectReference{
 				Kind:      "Deployment",
@@ -723,7 +775,23 @@ func (r *RebootPodReconciler) processHealthCheckQueue(ctx context.Context, obj i
 		var statefulSet appsv1.StatefulSet
 		if err := r.Get(ctx, namespacedName, &statefulSet); err == nil {
 			log.Info("Checking StatefulSet status after reboot", "name", statefulSet.Name, "namespace", statefulSet.Namespace)
-			if err := r.checkStatefulSetStatus(ctx, &statefulSet); err != nil {
+
+			// Check for resource-specific issues
+			warnings, err := r.logResourceWarnings(ctx, statefulSet.Name, statefulSet.Namespace, "StatefulSet")
+			if err != nil {
+				log.Error(err, "Failed to fetch warnings for StatefulSet", "name", statefulSet.Name)
+			}
+
+			for _, warning := range warnings {
+				eventIssues = append(eventIssues, corev1.ObjectReference{
+					Kind:      "StatefulSet",
+					Name:      statefulSet.Name,
+					Namespace: statefulSet.Namespace,
+					FieldPath: warning.Reason,
+				})
+			}
+
+			if err := r.checkStatefulSetStatus(&statefulSet); err != nil {
 				rolloutStatus = "Failure"
 				failedHealthCheck = append(failedHealthCheck, corev1.ObjectReference{
 					Kind:      "StatefulSet",
@@ -740,7 +808,7 @@ func (r *RebootPodReconciler) processHealthCheckQueue(ctx context.Context, obj i
 	}
 
 	// Update Status
-	if err := r.updateRebootPodStatus(ctx, namespacedName.Namespace, rolloutStatus, failedHealthCheck); err != nil {
+	if err := r.updateRebootPodStatus(ctx, namespacedName.Namespace, rolloutStatus, failedHealthCheck, eventIssues); err != nil {
 		log.Error(err, "Failed to update RebootPod status")
 		return err
 	}
@@ -752,7 +820,7 @@ func (r *RebootPodReconciler) processHealthCheckQueue(ctx context.Context, obj i
 }
 
 // updates the status subresource
-func (r *RebootPodReconciler) updateRebootPodStatus(ctx context.Context, namespace string, rolloutStatus string, failedHealthCheck []corev1.ObjectReference) error {
+func (r *RebootPodReconciler) updateRebootPodStatus(ctx context.Context, namespace string, rolloutStatus string, failedHealthCheck []corev1.ObjectReference, eventIssues []corev1.ObjectReference) error {
 	log := log.FromContext(ctx)
 
 	// List all RebootPods in the namespace
@@ -771,28 +839,31 @@ func (r *RebootPodReconciler) updateRebootPodStatus(ctx context.Context, namespa
 				return fmt.Errorf("failed to get latest RebootPod: %w", err)
 			}
 
+			// Ensure eventIssues is initialized even if no events are found
+			if eventIssues == nil {
+				eventIssues = []corev1.ObjectReference{}
+			}
+
 			// Update Status
 			switch rolloutStatus {
 			case "Success":
 				rebootPod.Status.RolloutStatus.State = "Success"
-				rebootPod.Status.RolloutStatus.FailedResources = nil
-				rebootPod.Status.RebootCompleted.State = true
-				rebootPod.Status.RebootCompleted.FailedHealthChecks = nil
+				rebootPod.Status.RolloutStatus.FailedHealthChecks = nil
+				rebootPod.Status.EventIssues = eventIssues
 			case "Failure":
 				rebootPod.Status.RolloutStatus.State = "Failure"
-				rebootPod.Status.RolloutStatus.FailedResources = failedHealthCheck
-				rebootPod.Status.RebootCompleted.State = false
-				rebootPod.Status.RebootCompleted.FailedHealthChecks = failedHealthCheck
+				rebootPod.Status.RolloutStatus.FailedHealthChecks = failedHealthCheck
+				rebootPod.Status.EventIssues = eventIssues
 			default: // Pending
 				rebootPod.Status.RolloutStatus.State = "Pending"
-				rebootPod.Status.RolloutStatus.FailedResources = nil
-				rebootPod.Status.RebootCompleted.State = false
-				rebootPod.Status.RebootCompleted.FailedHealthChecks = nil
+				rebootPod.Status.RolloutStatus.FailedHealthChecks = nil
+				rebootPod.Status.EventIssues = eventIssues
 			}
 
 			// Update LastHealthCheck
 			rebootPod.Status.LastHealthCheck = metav1.Now()
 
+			// log.Info("Updating RebootPod status", "status", rebootPod.Status)
 			// Perform the status update
 			return r.Status().Update(ctx, &rebootPod)
 		})
@@ -802,15 +873,15 @@ func (r *RebootPodReconciler) updateRebootPodStatus(ctx context.Context, namespa
 			return fmt.Errorf("failed to update RebootPod status for %s: %w", rebootPod.Name, err)
 		}
 
-		// Set Prometheus Metric Labels
-		rebootCompleted := "false"
-		if rebootPod.Status.RebootCompleted.State {
-			rebootCompleted = "true"
+		// Metric for failedResourcesCount
+		failedResourcesCount := len(rebootPod.Status.RolloutStatus.FailedHealthChecks)
+
+		// Metric for failed resource names
+		var failedResourceNames []string
+		for _, resource := range rebootPod.Status.RolloutStatus.FailedHealthChecks {
+			failedResourceNames = append(failedResourceNames, resource.Name)
 		}
-		failedResources := "None"
-		if len(rebootPod.Status.RebootCompleted.FailedHealthChecks) > 0 {
-			failedResources = fmt.Sprintf("%d", len(rebootPod.Status.RebootCompleted.FailedHealthChecks))
-		}
+		failedResourcesNamesLabel := strings.Join(failedResourceNames, ", ")
 
 		// Concatenate all RestartTargets names into a single string
 		var restartTargetNames []string
@@ -820,13 +891,18 @@ func (r *RebootPodReconciler) updateRebootPodStatus(ctx context.Context, namespa
 		// Join the names with a delimiter (e.g., a comma)
 		restartTargetsLabel := strings.Join(restartTargetNames, ", ")
 
+		// Count of events in the namespace
+		eventIssueCount := len(eventIssues)
+
+		// Update metrics
 		metrics.HealthCheckVSO.WithLabelValues(
-			rebootCompleted,
 			rebootPod.Status.RolloutStatus.State,
-			failedResources,
+			fmt.Sprintf("%d", failedResourcesCount),
+			failedResourcesNamesLabel,
 			rebootPod.Status.VaultSyncStatus.State,
 			rebootPod.Status.VaultSyncStatus.SynchedSecret[0].Name,
 			rebootPod.Spec.VaultEndpointDB,
+			fmt.Sprintf("%d", eventIssueCount),
 			namespace,
 			rebootPod.Name,
 			restartTargetsLabel,
@@ -880,7 +956,7 @@ func (r *RebootPodReconciler) StartPollingLoop(ctx context.Context) {
 							continue
 						}
 
-						log.Log.WithValues("name", name, "namespace", entry.Namespace, "ttl", ttl).Info("TTL expired, adding to queue for rollout restart after a minute")
+						log.Log.WithValues("name", name, "namespace", entry.Namespace, "ttl", ttl).Info("TTL expired, adding to queue for rollout restart")
 
 						// Add to workqueue after a short delay to initiate rollout-restart
 						r.Queue.AddAfter(types.NamespacedName{Name: name, Namespace: entry.Namespace}, 10*time.Second)
@@ -917,8 +993,9 @@ func (r *RebootPodReconciler) vaultSyncStatus(ctx context.Context, rebootPod *ga
 		}
 	}
 
+	// No secret found with vault creds
 	if matchingSecretName == "" {
-		log.Info("No matching Secret found for Vault credentials")
+		log.Info("No matching Secret found with Vault credentials")
 		return "", fmt.Errorf("no matching Secret found")
 	}
 

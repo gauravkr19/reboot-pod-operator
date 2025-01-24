@@ -13,7 +13,7 @@ var (
 			Name: "health_check_vso",
 			Help: "Health check metrics for reboot pods, reflecting their current status.",
 		},
-		[]string{"rebootCompleted", "rolloutStatus", "failedResources", "vaultSyncStatus", "synchedSecret", "vaultDB", "namespace", "rebootPod", "workloads"},
+		[]string{"rolloutStatus", "failedResourcesCount", "failedResources", "vaultSyncStatus", "synchedSecret", "vaultDB", "eventsCount", "namespace", "rebootPod", "workloads"},
 	)
 )
 

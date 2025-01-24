@@ -42,21 +42,15 @@ type RestartTarget struct {
 
 // RebootPodStatus defines the observed state of RebootPod
 type RebootPodStatus struct {
-	RolloutStatus   RolloutStatus `json:"rolloutStatus,omitempty"`
-	RebootCompleted RebootState   `json:"rebootCompleted,omitempty"`
-	LastHealthCheck metav1.Time   `json:"lastHealthCheck,omitempty"`
-	VaultSyncStatus VaultSync     `json:"vaultSyncStatus,omitempty"`
+	RolloutStatus   RolloutStatus            `json:"rolloutStatus,omitempty"`
+	LastHealthCheck metav1.Time              `json:"lastHealthCheck,omitempty"`
+	VaultSyncStatus VaultSync                `json:"vaultSyncStatus,omitempty"`
+	EventIssues     []corev1.ObjectReference `json:"eventIssues,omitempty"` // Field to track event-related issues
 }
 
-// RolloutStatus tracks the status of a rollout
+// RolloutStatus tracks the status of a rollout or pod reboot
 type RolloutStatus struct {
-	State           string                   `json:"state,omitempty"` // e.g., Success/Failure/Pending
-	FailedResources []corev1.ObjectReference `json:"failedResources,omitempty"`
-}
-
-// RebootCompleted tracks the status of a rollout restart
-type RebootState struct {
-	State              bool                     `json:"state,omitempty"` // eg. true/false
+	State              string                   `json:"state,omitempty"` // Success/Failure
 	FailedHealthChecks []corev1.ObjectReference `json:"failedHealthChecks,omitempty"`
 }
 
