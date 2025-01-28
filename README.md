@@ -1,8 +1,8 @@
 # rebootpod-controller
-This controller reboots the pod when TTL of the database password, fetched from Hashicorp Vault, expires. 
+The RebootPod controller reboots the pod when TTL of the database password, fetched from Hashicorp Vault, expires. 
 
 ## Description
-This project is inspired from Hashicorp Vault Secret Operator(VSO) project. VaultDynamicSecret(VDS) a CR from VSO, syncs the database password to k8s Secret and upon password expiry reboots the Pod. Pod reboot is implemented by [_rolloutRestartTargets_](https://developer.hashicorp.com/vault/docs/platform/k8s/vso/api-reference#rolloutrestarttarget). The `rolloutRestartTargets` of VDS is not guaranteed to work with open source vault (as confirmed by Hashicorp Support). This project implements `rolloutRestartTargets` via the CR `RebootPod` which fetches TTL from Vault every 24 hours and reboots the pod listed in the `restartTargets` of the CR. 
+This project is inspired from Hashicorp Vault Secret Operator(VSO) project. VaultDynamicSecret(VDS) a CR from VSO, syncs the database password to k8s Secret and upon password expiry reboots the Pod. Pod reboot is implemented by [_rolloutRestartTargets_](https://developer.hashicorp.com/vault/docs/platform/k8s/vso/api-reference#rolloutrestarttarget). The `rolloutRestartTargets` of VDS is not guaranteed to work with open source vault (as confirmed by Hashicorp Support). This project implements `rolloutRestartTargets` via the CR `RebootPod` which fetches TTL from Vault and reboots the pod listed in the `restartTargets` of the CR. The code also updates .status subresource and Prometheus metrics to monitor `rolloutStatus` and `vaultSyncStatus` of each of the CRs.
 
 # CR
 The RebootPod CR
@@ -22,16 +22,27 @@ spec:
     name: test-deploy-apps1
   - kind: StatefulSet
     name: test-sts-apps2
+status:
+  lastHealthCheck: "2025-01-28T07:26:10Z"
+  rolloutStatus:
+    state: Success
+  vaultSyncStatus:
+    state: Success
+    synchedSecret:
+    - name: db-postgres2-secret-apps
+      namespace: apps
 ```
 ### Authentication with Vault
-Operator runs as Deployment and its Pod's service account authenticates via its JWT. `database/static-creds/dev-postgres` this a sensitive endpoint which returns database password along with `ttl` and `last_vault_rotation`, We make use of these fields-  `ttl` and `last_vault_rotation`, to determine the password expiration of the database.
+Operator runs as Deployment and its Pod's service account authenticates via its JWT. `database/static-creds/dev-postgres` this a sensitive endpoint which returns database password along with `ttl` and `last_vault_rotation`, We make use of these fields-  `ttl` and `last_vault_rotation`, to determine the password expiration of the database. We also capture the database password from Vault to compare with the synced K8s secret and expose the status via .status subresource and metrics.
 
 ### Releases
 * version-1: [Requeue intervals are dynamically adjusted based on TTL value](https://github.com/gauravkr19/reboot-pod-operator/blob/6d405f6d258ec2519ffcf3bd6957a46bb904128a/internal/controller/rebootpod_controller.go)
 * version-2: [Used goroutine with waitgroup](https://github.com/gauravkr19/reboot-pod-operator/commit/068b36f96e6b8dee7021fbf13527ffced3b15917)\
 Attempted to insert sleep itervals instead of calling Vault API several times. But it missed the TTL expiry of another CR when sleeping on longer intervals. Just used goroutine with waitgroup
 * version-3: [Used cache to track the ttl expiration minimizing on controller requeues and call to Vault API](https://github.com/gauravkr19/reboot-pod-operator/commit/4658f8965a75c10cc3d7a371175943ab462c18e8)
-* version-4: [Used workqueue, Informer and Prometheus metrics](https://github.com/gauravkr19/reboot-pod-operator/commit/d43d3512248b520f20083fbedec56d9a8133fe10)
+* version-4: [Used workqueue, Informer and Prometheus metrics](https://github.com/gauravkr19/reboot-pod-operator/commit/d43d3512248b520f20083fbedec56d9a8133fe10) Introduces workqueues for rollout restart & and for health check. Also, updates .status subresource and Prometheus metrics to monitor `rolloutStatus` and `vaultSyncStatus` of each of the CRs. 
+
+<img width="926" alt="image" src="https://github.com/user-attachments/assets/3a205e22-07dd-4370-9f13-727201394db5" />
 
 ## Getting Started
 
