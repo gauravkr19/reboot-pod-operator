@@ -916,7 +916,7 @@ func (r *RebootPodReconciler) updateRebootPodStatus(ctx context.Context, namespa
 // Check if the TTL might have expired based on last known rotation and current time
 func ttlExpired(lastRotation time.Time) bool {
 	// TTL expiry missed by 4s, consider it expired
-	expirationBuffer := 4 * time.Second
+	expirationBuffer := 10 * time.Second
 	now := time.Now()
 	// lastRotationExtended := lastRotation.Add(30 * time.Second)
 	// Check if the difference between now and the last known rotation time indicates expiration
@@ -928,43 +928,67 @@ func (r *RebootPodReconciler) StartPollingLoop(ctx context.Context) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
-	// Track processed entries to avoid duplicate actions for the same expiry
+	// Map variable to address processing once in 10s expirationBuffer
 	processed := make(map[string]time.Time)
+	cleanupInterval := 1 * time.Minute
+	lastCleanup := time.Now()
+
+	// Variable to track whether cleanup is needed
+	needsCleanup := false
 
 	for {
 		select {
-		case <-ctx.Done(): // Stop polling when the context is canceled
+		case <-ctx.Done():
 			return
-		case <-ticker.C: // Execute logic at regular intervals
+		case <-ticker.C:
 
-			for name, entry := range r.Cache { // Iterate over each CR in the cache
+			// Iterate over each CR in the cache
+			for name, entry := range r.Cache {
 				resourceKey := fmt.Sprintf("%s/%s", name, entry.Namespace)
 
-				// First check to validate TTL based on cached data
-				if time.Now().After(entry.Expiration) {
-					ttl, lastRotation, _, _, err := r.fetchTTLFromVault(ctx, name, entry.Namespace)
-					if err != nil {
-						log.Log.WithValues("name", name, "namespace", entry.Namespace).Error(err, "Failed to confirm TTL from Vault")
-						continue // Skip this iteration if the Vault call fails
+				// Skip the rest of the logic if expiration is in the future
+				if !time.Now().After(entry.Expiration) {
+					continue
+				}
+
+				// Fetch TTL and confirm if it is expired
+				ttl, lastRotation, _, _, err := r.fetchTTLFromVault(ctx, name, entry.Namespace)
+				if err != nil {
+					log.Log.WithValues("name", name, "namespace", entry.Namespace).Error(err, "Failed to confirm TTL from Vault")
+					continue
+				}
+
+				// Check TTL expiration
+				if ttl == 0 || ttlExpired(lastRotation) {
+
+					// Avoid duplicate actions
+					lastProcessed, alreadyProcessed := processed[resourceKey]
+					if alreadyProcessed && time.Since(lastProcessed) < 30*time.Second {
+						continue
 					}
 
-					// Second check to validate TTL from Vault before queuing
-					if ttl == 0 || ttlExpired(lastRotation) {
+					// Log and add to the queue
+					log.Log.WithValues("name", name, "namespace", entry.Namespace, "ttl", ttl).Info("TTL expired, adding to queue for rollout restart")
+					r.Queue.AddAfter(types.NamespacedName{Name: name, Namespace: entry.Namespace}, 5*time.Second)
 
-						lastProcessed, alreadyProcessed := processed[resourceKey]
-						if alreadyProcessed && time.Since(lastProcessed) < 30*time.Second {
-							continue
-						}
+					// Mark the resource as processed
+					processed[resourceKey] = time.Now()
 
-						log.Log.WithValues("name", name, "namespace", entry.Namespace, "ttl", ttl).Info("TTL expired, adding to queue for rollout restart")
+					// Flag cleanup as necessary
+					needsCleanup = true
+				}
+			}
 
-						// Add to workqueue after a short delay to initiate rollout-restart
-						r.Queue.AddAfter(types.NamespacedName{Name: name, Namespace: entry.Namespace}, 10*time.Second)
-
-						// Mark as processed with the current timestamp
-						processed[resourceKey] = time.Now()
+			// Perform cleanup only if necessary
+			if needsCleanup && time.Since(lastCleanup) > cleanupInterval {
+				now := time.Now()
+				for key, timestamp := range processed {
+					if now.Sub(timestamp) > 30*time.Second {
+						delete(processed, key)
 					}
 				}
+				lastCleanup = now
+				needsCleanup = false // Reset the flag after cleanup
 			}
 		}
 	}
