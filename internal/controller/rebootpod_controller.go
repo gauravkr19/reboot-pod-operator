@@ -61,7 +61,6 @@ type RebootPodReconciler struct {
 	UseTLS                    bool
 	Cache                     map[string]TTLCacheEntry // cache to store TTLs of all the CRs and poll concurrently to check the expiration
 	CacheMutex                sync.Mutex
-	HealthCheckMutex          sync.Mutex                                                 // Mutex for safe concurrent access to Cache
 	HealthCheckCache          sync.Map                                                   // Map of enqueued resources by NamespacedName
 	ProcessedResourceVersions sync.Map                                                   // Map to track last processed ResourceVersion
 	Queue                     workqueue.TypedRateLimitingInterface[types.NamespacedName] // Work Queue for rollout-restart
@@ -69,6 +68,7 @@ type RebootPodReconciler struct {
 	MissingCRs                map[string]struct{}                                        // Tracks missing CRs and prevents continous logging when CR is deleted
 	LastCacheLogTime          time.Time                                                  // Controls the frequency of cache printing in the logs
 	ReportingCRs              bool                                                       // Prints the table with CR and its attributes
+	HealthCheckTracker        sync.Map                                                   // Map[workloadKey]LogEntry, to control logging freq
 }
 
 // TTLCacheEntry stores the expiration time and last rotation for each CR.
@@ -161,40 +161,15 @@ func (r *RebootPodReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	restartTargets := r.getRestartTargets(&rebootPod)
 	r.SetupInformerForStatusCheck(ctx, rebootPod.Namespace, restartTargets, req.NamespacedName)
 
-	// Fetch Vault credentials and perform vault sync status check
-	_, _, username, password, err := r.fetchTTLFromVault(ctx, req.Name, req.Namespace)
-	if err != nil {
-		log.Error(err, "Failed to fetch Vault credentials")
-		return ctrl.Result{}, err
-	}
-
-	secretName, err := r.vaultSyncStatus(ctx, &rebootPod, username, password)
-	if err != nil {
-		rebootPod.Status.VaultSyncStatus = gauravkr19devv1alpha1.VaultSync{
-			State: "Failure",
-			SynchedSecret: []corev1.ObjectReference{
-				{Name: "NoMatchingSecret", Namespace: rebootPod.Namespace},
-			},
-		}
-	} else {
-		rebootPod.Status.VaultSyncStatus = gauravkr19devv1alpha1.VaultSync{
-			State: "Success",
-			SynchedSecret: []corev1.ObjectReference{
-				{Name: secretName, Namespace: rebootPod.Namespace},
-			},
-		}
-	}
-
-	// Update the CR's status
+	// update vault sync status
+	_ = r.updateVaultSyncStatus(ctx, &rebootPod)
 	if err := r.Status().Update(ctx, &rebootPod); err != nil {
-		log.Error(err, "Failed to update RebootPod status")
-		return ctrl.Result{}, err
+		log.Error(err, "Failed to update Vault sync status")
 	}
 
 	// Update general metrics using the CR’s status:
 	metrics.UpdateMetrics(ctx, &rebootPod)
 
-	log.Info("Reconciled RebootPod and updated cache", "CR", req.Name)
 	return ctrl.Result{RequeueAfter: 1 * time.Hour}, nil
 }
 
@@ -241,10 +216,10 @@ func (r *RebootPodReconciler) fetchTTLFromVault(ctx context.Context, name, names
 		} else {
 			// Enable InsecureSkipVerify if no CA certificate is provided
 			tlsConfig.Insecure = true
-			// log.Info("No CA certificate provided. Using InsecureSkipVerify=true for TLS.")
+			log.V(2).Info("No CA certificate provided. Using InsecureSkipVerify=true for TLS.")
 		}
 	} else {
-		log.Info("TLS is disabled.")
+		log.V(2).Info("TLS is disabled.")
 	}
 
 	// Apply TLS configuration to Vault client
@@ -263,8 +238,8 @@ func (r *RebootPodReconciler) fetchTTLFromVault(ctx context.Context, name, names
 	vaultEndpointDB := rebootPod.Spec.VaultEndpointDB
 	AuthPath := os.Getenv("AuthPath")
 
-	// jwtToken, err := os.ReadFile("/home/cloud_user/my-controller/unseal/jwt_token")
-	jwtToken, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
+	jwtToken, err := os.ReadFile("/home/cloud_user/my-controller/unseal/jwt_token")
+	// jwtToken, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
 	if err != nil {
 		log.Error(err, "unable to read ServiceAccount JWT token")
 	}
@@ -352,7 +327,7 @@ func (r *RebootPodReconciler) handleRollout(ctx context.Context, name string, na
 	delete(r.Cache, name)
 	r.CacheMutex.Unlock()
 
-	log.Info("Updating the cache with TTL and last rotation info", "CR", name)
+	log.V(2).Info("Updating the cache with TTL and last rotation info", "CR", name)
 	if err := r.updateCache(ctx, name, namespace); err != nil {
 		log.WithValues("name", name, "namespace", namespace).Error(err, "Failed to update TTL cache after reboot")
 	}
@@ -434,7 +409,7 @@ func (r *RebootPodReconciler) getResourceEventHandler(namespace string, restartT
 
 			// Check if the ResourceVersion is already processed
 			if lastRV, ok := r.ProcessedResourceVersions.Load(key); ok && lastRV == newRV {
-				// log.Log.V(1).Info("Skipping event: ResourceVersion unchanged", "Name", newU.GetName(), "Namespace", newU.GetNamespace(), "ResourceVersion", newRV)
+				// log.Log.V(2).Info("Skipping event: ResourceVersion unchanged", "Name", newU.GetName(), "Namespace", newU.GetNamespace(), "ResourceVersion", newRV)
 				return
 			}
 
@@ -452,71 +427,39 @@ func (r *RebootPodReconciler) getResourceEventHandler(namespace string, restartT
 	}
 }
 
-// enqueueResourceIfMonitored enqueues the resource only if it's in RestartTargets and replicas match
+// enqueueResourceIfMonitored enqueues the resource only if it's in RestartTargets and prevents redundant checks.
 func (r *RebootPodReconciler) enqueueResourceIfMonitored(obj interface{}, workloadNamespace string, restartTargets []corev1.ObjectReference, crKey types.NamespacedName) {
 	u := obj.(*unstructured.Unstructured)
 	workloadName := u.GetName()
-	const checkInterval = 5 * time.Minute // Control log frequency
+	const checkInterval = 5 * time.Minute // Control how often workloads are retried
 
-	// For each target in restartTargets, check if it matches the workload details.
+	// Process only if the workload matches one of the restartTargets.
 	for _, target := range restartTargets {
 		if target.Name == workloadName && target.Namespace == workloadNamespace && target.Kind == u.GetKind() {
-
-			// Check replica status to avoid redundant queuing
-			updatedReplicas, _, _ := unstructured.NestedInt64(u.Object, "status", "updatedReplicas")
-			desiredReplicas, _, _ := unstructured.NestedInt64(u.Object, "spec", "replicas")
-
-			// Build the workload's namespaced name
-			workloadKey := types.NamespacedName{Name: workloadName, Namespace: workloadNamespace}
-
-			// Only enqueue if the workload is unhealthy
-			if updatedReplicas != desiredReplicas {
-				// Avoid re-queuing if already enqueued (using HealthCheckCache for the workload key)
-				if _, loaded := r.HealthCheckCache.LoadOrStore(workloadKey, time.Now()); !loaded {
-					log.Log.Info("Adding to HealthCheckQueue for monitoring", "Workload", workloadName, "Namespace", workloadNamespace, "CR", crKey.Name)
-					// r.HealthCheckQueue.AddAfter(namespacedName, time.Minute) // Add to health-check queue
-					// Create the combined HealthCheckItem and enqueue it
-					item := HealthCheckItem{
-						WorkloadKey: workloadKey,
-						CRKey:       crKey,
-					}
-					r.HealthCheckQueue.AddAfter(item, time.Minute)
-				}
-			} else {
-				// If healthy, remove from HealthCheckCache if sufficient time has passed
-				if lastChecked, ok := r.HealthCheckCache.Load(workloadKey); ok {
-					if time.Since(lastChecked.(time.Time)) >= checkInterval {
-						log.Log.Info("Workload is healthy, removing from HealthCheckCache", "Workload", workloadName, "Namespace", workloadNamespace)
-						r.HealthCheckCache.Delete(workloadKey)
-					}
-				}
+			// Build the workload's namespaced name.
+			workloadKey := types.NamespacedName{
+				Name:      workloadName,
+				Namespace: workloadNamespace,
 			}
+
+			// Check if the workload has already been enqueued recently
+			lastChecked, loaded := r.HealthCheckCache.Load(workloadKey)
+
+			if !loaded || time.Since(lastChecked.(time.Time)) >= checkInterval {
+				// Update cache with the current time to track the last enqueue
+				r.HealthCheckCache.Store(workloadKey, time.Now())
+				log.Log.V(2).Info("Queuing workload for health check", "Workload", workloadName, "Namespace", workloadNamespace, "CR", crKey.Name)
+
+				// Create and enqueue the health check item
+				item := HealthCheckItem{
+					WorkloadKey: workloadKey,
+					CRKey:       crKey,
+				}
+				r.HealthCheckQueue.AddAfter(item, 1*time.Minute)
+			}
+			break // Stop checking further targets once a match is found
 		}
 	}
-}
-
-// checkDeploymentStatus checks the rollout status of a specific Deployment and logs.
-func (r *RebootPodReconciler) checkDeploymentStatus(deployment *appsv1.Deployment) error {
-
-	if deployment.Status.UpdatedReplicas != *deployment.Spec.Replicas ||
-		deployment.Status.ReadyReplicas != *deployment.Spec.Replicas {
-		log.Log.Info("Deployment rollout is in progress", "name", deployment.Name, "namespace", deployment.Namespace)
-		return fmt.Errorf("rollout in progress")
-	}
-
-	log.Log.Info("Deployment health check is complete", "deployment", deployment.Name)
-	return nil
-}
-
-// Checks rollout status of statefulSet and logs
-func (r *RebootPodReconciler) checkStatefulSetStatus(statefulSet *appsv1.StatefulSet) error {
-	if statefulSet.Status.UpdatedReplicas != *statefulSet.Spec.Replicas ||
-		statefulSet.Status.ReadyReplicas != *statefulSet.Spec.Replicas {
-		return fmt.Errorf("statefulSet rollout in progress for %s in %s", statefulSet.Name, statefulSet.Namespace)
-	}
-
-	log.Log.Info("StatefulSet health check is complete", "statefulSet", statefulSet.Name)
-	return nil
 }
 
 // func logResourceWarnings finds events related to resource issue
@@ -561,7 +504,7 @@ func (r *RebootPodReconciler) updateCache(ctx context.Context, name, namespace s
 	if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, &rebootPod); err != nil {
 		// Log and track missing CRs
 		if _, alreadyLogged := r.MissingCRs[key]; !alreadyLogged {
-			log.Error(err, fmt.Sprintf("Cache update failed, the CR %s may be deleted", name), "name", name, "namespace", namespace)
+			log.V(1).Info(fmt.Sprintf("Not able to find the CR %s,  may be its deleted", name), "name", name, "namespace", namespace)
 			r.MissingCRs[key] = struct{}{}
 		}
 
@@ -718,111 +661,135 @@ func (r *RebootPodReconciler) startHealthCheckWorker(ctx context.Context) {
 					}
 				}()
 				healthItem := obj
-
-				if err := r.processHealthCheckQueue(ctx, healthItem); err != nil {
-					if strings.Contains(err.Error(), "rollout in progress") {
-						log.Info("Requeuing workload for further checks", "item", healthItem)
-						r.HealthCheckQueue.AddAfter(healthItem, time.Minute)
-					} else {
-						log.Error(err, "Error processing item from HealthCheckQueue", "item", healthItem)
-					}
-				}
+				_ = r.processHealthCheckQueue(ctx, healthItem)
 			}()
 		}
 	}
 }
 
-// calls checkDeploymentStatus or checkStatefulSetStatus for status check after pod reboot
+// Initialize the health check queue with custom exponential backoff retry
+func (r *RebootPodReconciler) SetupHealthCheckQueue() {
+	// Define the exponential backoff: starts at 1 min, max retry delay 12 hour
+	rateLimiter := workqueue.NewTypedItemExponentialFailureRateLimiter[HealthCheckItem](1*time.Minute, 12*time.Hour)
+
+	// Configure the queue with the rate limiter
+	queueConfig := workqueue.TypedRateLimitingQueueConfig[HealthCheckItem]{
+		Name: "health-check-queue",
+	}
+
+	// Create the queue with the configured rate limiter
+	r.HealthCheckQueue = workqueue.NewTypedRateLimitingQueueWithConfig(rateLimiter, queueConfig)
+}
+
 func (r *RebootPodReconciler) processHealthCheckQueue(ctx context.Context, item HealthCheckItem) error {
 	log := log.FromContext(ctx)
+	var rebootPod gauravkr19devv1alpha1.RebootPod
 
-	// Use the workload key to determine which workload to check
-	namespacedName := item.WorkloadKey
+	// Fetch the RebootPod CR to get the workload type
+	if err := r.Get(ctx, item.CRKey, &rebootPod); err != nil {
+		log.Error(err, "Failed to fetch RebootPod for workload kind determination", "CRKey", item.CRKey)
+		return err
+	}
 
-	var rolloutStatus string
+	// Track overall rollout status
+	allSucceeded := true
+	var failureMessages []string
 	var failedHealthCheck []corev1.ObjectReference
 	var eventIssues []corev1.ObjectReference
 
-	// Determine the type of workload and fetch the resource accordingly
-	var deployment appsv1.Deployment
-	if err := r.Get(ctx, namespacedName, &deployment); err == nil {
+	// Iterate over all RestartTargets to determine overall health
+	for _, target := range rebootPod.Spec.RestartTargets {
+		workloadKind := target.Kind
+		workloadKey := types.NamespacedName{Name: target.Name, Namespace: item.WorkloadKey.Namespace}
 
-		// Check for resource-specific issues
-		warnings, err := r.logResourceWarnings(ctx, deployment.Name, deployment.Namespace, "Deployment")
+		// Fetch the workload dynamically
+		workload := &unstructured.Unstructured{}
+		workload.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "apps",
+			Version: "v1",
+			Kind:    workloadKind,
+		})
+
+		if err := r.Get(ctx, workloadKey, workload); err != nil {
+			if errors.IsNotFound(err) {
+				log.Error(err, fmt.Sprintf("%s not found", workloadKind), "name", target.Name)
+				continue
+			}
+			log.Error(err, fmt.Sprintf("Failed to fetch %s", workloadKind), "name", target.Name)
+			continue
+		}
+
+		// Fetch warnings
+		warnings, err := r.logResourceWarnings(ctx, target.Name, item.WorkloadKey.Namespace, workloadKind)
 		if err != nil {
-			log.Error(err, "Failed to fetch warnings for Deployment", "name", deployment.Name, "namespace", deployment.Namespace)
+			log.Error(err, fmt.Sprintf("Failed to fetch warnings for %s", workloadKind), "name", target.Name)
 		}
 
 		for _, warning := range warnings {
 			eventIssues = append(eventIssues, corev1.ObjectReference{
-				Kind:      "Deployment",
-				Name:      deployment.Name,
-				Namespace: deployment.Namespace,
+				Kind:      workloadKind,
+				Name:      target.Name,
+				Namespace: item.WorkloadKey.Namespace,
 				FieldPath: warning.Reason,
 			})
 		}
 
-		// Check Deployment status
-		if err := r.checkDeploymentStatus(&deployment); err != nil {
-			rolloutStatus = "Failure"
-			failedHealthCheck = append(failedHealthCheck, corev1.ObjectReference{
-				Kind:      "Deployment",
-				Name:      deployment.Name,
-				Namespace: deployment.Namespace,
-			})
-		} else {
-			rolloutStatus = "Success"
-			// Health check complete; remove from cache and forget from queue
-			r.HealthCheckCache.Delete(namespacedName)
-			r.HealthCheckQueue.Forget(item)
-		}
-	} else {
-		var statefulSet appsv1.StatefulSet
-		if err := r.Get(ctx, namespacedName, &statefulSet); err == nil {
-			log.Info("Checking StatefulSet status after reboot", "name", statefulSet.Name, "namespace", statefulSet.Namespace)
-
-			// Check for resource-specific issues
-			warnings, err := r.logResourceWarnings(ctx, statefulSet.Name, statefulSet.Namespace, "StatefulSet")
-			if err != nil {
-				log.Error(err, "Failed to fetch warnings for StatefulSet", "name", statefulSet.Name)
-			}
-
-			for _, warning := range warnings {
-				eventIssues = append(eventIssues, corev1.ObjectReference{
-					Kind:      "StatefulSet",
-					Name:      statefulSet.Name,
-					Namespace: statefulSet.Namespace,
-					FieldPath: warning.Reason,
-				})
-			}
-
-			if err := r.checkStatefulSetStatus(&statefulSet); err != nil {
-				rolloutStatus = "Failure"
-				failedHealthCheck = append(failedHealthCheck, corev1.ObjectReference{
-					Kind:      "StatefulSet",
-					Name:      statefulSet.Name,
-					Namespace: statefulSet.Namespace,
-				})
+		// Check workload status
+		var failureDetails string
+		switch workloadKind {
+		case "Deployment":
+			var deployment appsv1.Deployment
+			if convErr := runtime.DefaultUnstructuredConverter.FromUnstructured(workload.Object, &deployment); convErr == nil {
+				failureDetails, err = r.checkDeploymentStatus(ctx, &deployment)
 			} else {
-				rolloutStatus = "Success"
-				// Health check complete; remove from cache and forget from queue
-				r.HealthCheckCache.Delete(namespacedName)
-				r.HealthCheckQueue.Forget(item)
+				err = convErr
 			}
+		case "StatefulSet":
+			var statefulSet appsv1.StatefulSet
+			if convErr := runtime.DefaultUnstructuredConverter.FromUnstructured(workload.Object, &statefulSet); convErr == nil {
+				failureDetails, err = r.checkStatefulSetStatus(ctx, &statefulSet)
+			} else {
+				err = convErr
+			}
+		}
+
+		// Handle failure scenarios
+		if err != nil {
+			allSucceeded = false
+			failureMessages = append(failureMessages, fmt.Sprintf("%s %s: %s", workloadKind, target.Name, failureDetails))
+			failedHealthCheck = append(failedHealthCheck, corev1.ObjectReference{
+				Kind:      workloadKind,
+				Name:      target.Name,
+				Namespace: item.WorkloadKey.Namespace,
+			})
+
+			log.V(2).Info(fmt.Sprintf("%s not healthy, requeuing with rate limiting", workloadKind), "workload", target.Name)
+			r.HealthCheckQueue.AddRateLimited(item)
 		} else {
-			log.Error(err, "Failed to fetch resource for health check")
-			return err
+			// Workload is healthy, remove from cache
+			r.HealthCheckCache.Delete(workloadKey)
+			r.HealthCheckQueue.Forget(item)
 		}
 	}
 
-	// Update Status
-	if err := r.updateRebootPodStatus(ctx, namespacedName.Namespace, rolloutStatus, failedHealthCheck, eventIssues); err != nil {
-		log.Error(err, "Failed to update RebootPod status", "namespace", namespacedName.Namespace)
+	// Determine final rollout status
+	var rolloutStatus string
+	if allSucceeded {
+		rolloutStatus = "Success"
+	} else {
+		rolloutStatus = fmt.Sprintf("Failure: %s", strings.Join(failureMessages, "; "))
+	}
+
+	// Refresh sync status and publish it along with rolloutStatus
+	syncStatus := r.updateVaultSyncStatus(ctx, &rebootPod)
+
+	// Update RebootPod status
+	if err := r.updateRebootPodStatus(ctx, item.WorkloadKey.Namespace, rolloutStatus, failedHealthCheck, eventIssues, syncStatus); err != nil {
+		log.Error(err, "Failed to update RebootPod status", "namespace", item.WorkloadKey.Namespace)
 		return err
 	}
 
-	// Retrieve the RebootPod using CRKey to update metrics.
-	var rebootPod gauravkr19devv1alpha1.RebootPod
+	// Retrieve RebootPod and update metrics
 	if err := r.Get(ctx, item.CRKey, &rebootPod); err == nil {
 		metrics.UpdateMetrics(ctx, &rebootPod)
 	} else {
@@ -832,8 +799,108 @@ func (r *RebootPodReconciler) processHealthCheckQueue(ctx context.Context, item 
 	return nil
 }
 
+func (r *RebootPodReconciler) checkDeploymentStatus(ctx context.Context, deployment *appsv1.Deployment) (string, error) {
+	return r.checkWorkloadStatus(ctx, "Deployment", deployment)
+}
+
+func (r *RebootPodReconciler) checkStatefulSetStatus(ctx context.Context, statefulSet *appsv1.StatefulSet) (string, error) {
+	return r.checkWorkloadStatus(ctx, "StatefulSet", statefulSet)
+}
+
+func (r *RebootPodReconciler) checkWorkloadStatus(ctx context.Context, workloadType string, workload client.Object) (string, error) {
+	log := log.FromContext(ctx)
+	var failureMessages []string
+
+	// 1. Replica Count Check
+	var desiredReplicas, updatedReplicas, readyReplicas int32
+	switch w := workload.(type) {
+	case *appsv1.Deployment:
+		if w.Spec.Replicas != nil {
+			desiredReplicas = *w.Spec.Replicas
+		}
+		updatedReplicas = w.Status.UpdatedReplicas
+		readyReplicas = w.Status.ReadyReplicas
+	case *appsv1.StatefulSet:
+		if w.Spec.Replicas != nil {
+			desiredReplicas = *w.Spec.Replicas
+		}
+		updatedReplicas = w.Status.ReadyReplicas // StatefulSets track readiness differently
+		readyReplicas = w.Status.ReadyReplicas
+	default:
+		return "", fmt.Errorf("unsupported workload type: %T", workload)
+	}
+
+	if updatedReplicas != desiredReplicas || readyReplicas != desiredReplicas {
+		msg := fmt.Sprintf("%s rollout in progress for %s/%s: updated=%d, ready=%d, desired=%d",
+			workloadType, workload.GetNamespace(), workload.GetName(), updatedReplicas, readyReplicas, desiredReplicas)
+		failureMessages = append(failureMessages, msg)
+	}
+
+	// 2. List Pods for the workload
+	var selector *metav1.LabelSelector
+	switch w := workload.(type) {
+	case *appsv1.Deployment:
+		selector = w.Spec.Selector
+	case *appsv1.StatefulSet:
+		selector = w.Spec.Selector
+	}
+
+	labelSelector, err := metav1.LabelSelectorAsSelector(selector)
+	if err != nil {
+		msg := fmt.Sprintf("failed to parse label selector for %s/%s: %v", workloadType, workload.GetNamespace(), workload.GetName())
+		failureMessages = append(failureMessages, msg)
+	} else {
+		var podList corev1.PodList
+		if err := r.List(ctx, &podList, client.InNamespace(workload.GetNamespace()), client.MatchingLabelsSelector{Selector: labelSelector}); err != nil {
+			msg := fmt.Sprintf("failed to list pods for %s/%s: %v", workloadType, workload.GetNamespace(), workload.GetName())
+			failureMessages = append(failureMessages, msg)
+		} else if len(podList.Items) == 0 {
+			msg := fmt.Sprintf("no pods found for %s/%s in namespace %s", workloadType, workload.GetName(), workload.GetNamespace())
+			failureMessages = append(failureMessages, msg)
+		} else {
+			// 3. Check Pod health
+			for _, pod := range podList.Items {
+				if pod.Status.Phase != corev1.PodRunning {
+					failureMessages = append(failureMessages, fmt.Sprintf("Pod %s is in phase %s", pod.Name, pod.Status.Phase))
+				}
+
+				ready := false
+				for _, cond := range pod.Status.Conditions {
+					if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+						ready = true
+						break
+					}
+				}
+				if !ready {
+					failureMessages = append(failureMessages, fmt.Sprintf("Pod %s is not Ready", pod.Name))
+				}
+
+				// 4. Check for CrashLoopBackOff in Containers
+				for _, containerStatus := range pod.Status.ContainerStatuses {
+					// if containerStatus.RestartCount > 0 {
+					// 	msg := fmt.Sprintf("Pod %s - Container %s has restarted %d times", pod.Name, containerStatus.Name, containerStatus.RestartCount)
+					// 	failureMessages = append(failureMessages, msg)
+					// }
+					if containerStatus.State.Waiting != nil && containerStatus.State.Waiting.Reason == "CrashLoopBackOff" {
+						msg := fmt.Sprintf("Pod %s - Container %s is in CrashLoopBackOff", pod.Name, containerStatus.Name)
+						failureMessages = append(failureMessages, msg)
+					}
+				}
+			}
+		}
+	}
+
+	if len(failureMessages) > 0 {
+		log.V(1).Info("Deployment health check failed", "deployment", workload.GetName(), "namespace", workload.GetNamespace(), "errors", strings.Join(failureMessages, "; "))
+		return strings.Join(failureMessages, "; "), fmt.Errorf(strings.Join(failureMessages, "; "))
+	}
+
+	log.V(2).Info(fmt.Sprintf("%s health check is complete", workloadType), "workload", workload.GetName(), "namespace", workload.GetNamespace())
+	return "", nil
+}
+
 // updates the status subresource
-func (r *RebootPodReconciler) updateRebootPodStatus(ctx context.Context, namespace string, rolloutStatus string, failedHealthCheck []corev1.ObjectReference, eventIssues []corev1.ObjectReference) error {
+func (r *RebootPodReconciler) updateRebootPodStatus(ctx context.Context, namespace string, rolloutStatus string, failedHealthCheck []corev1.ObjectReference, eventIssues []corev1.ObjectReference, syncStatus gauravkr19devv1alpha1.VaultSync) error {
 	log := log.FromContext(ctx)
 
 	// List all RebootPods in the namespace
@@ -857,26 +924,22 @@ func (r *RebootPodReconciler) updateRebootPodStatus(ctx context.Context, namespa
 				eventIssues = []corev1.ObjectReference{}
 			}
 
-			// Update Status
 			switch rolloutStatus {
 			case "Success":
 				rebootPod.Status.RolloutStatus.State = "Success"
 				rebootPod.Status.RolloutStatus.FailedHealthChecks = nil
 				rebootPod.Status.EventIssues = eventIssues
-			case "Failure":
-				rebootPod.Status.RolloutStatus.State = "Failure"
+			default: // Failure
+				rebootPod.Status.RolloutStatus.State = rolloutStatus
 				rebootPod.Status.RolloutStatus.FailedHealthChecks = failedHealthCheck
-				rebootPod.Status.EventIssues = eventIssues
-			default: // Pending
-				rebootPod.Status.RolloutStatus.State = "Pending"
-				rebootPod.Status.RolloutStatus.FailedHealthChecks = nil
 				rebootPod.Status.EventIssues = eventIssues
 			}
 
-			// Update LastHealthCheck
+			// Update LastHealthCheck and sync status
 			rebootPod.Status.LastHealthCheck = metav1.Now()
+			rebootPod.Status.VaultSyncStatus = syncStatus
 
-			// log.Info("Updating RebootPod status", "status", rebootPod.Status)
+			log.V(2).Info("Updating RebootPod status", "status", rebootPod.Status)
 			// Perform the status update
 			return r.Status().Update(ctx, &rebootPod)
 		})
@@ -885,8 +948,7 @@ func (r *RebootPodReconciler) updateRebootPodStatus(ctx context.Context, namespa
 			log.Error(err, "Failed to update RebootPod status after retries", "namespace", namespace, "name", rebootPod.Name)
 			return fmt.Errorf("failed to update RebootPod status for %s: %w", rebootPod.Name, err)
 		}
-
-		log.Info("Successfully updated RebootPod status", "namespace", namespace, "name", rebootPod.Name)
+		log.V(2).Info("Updated RebootPod status", "namespace", namespace, "name", rebootPod.Name)
 	}
 	return nil
 }
@@ -972,6 +1034,48 @@ func (r *RebootPodReconciler) StartPollingLoop(ctx context.Context) {
 	}
 }
 
+// helper function to update vault sync status
+func (r *RebootPodReconciler) updateVaultSyncStatus(ctx context.Context, rebootPod *gauravkr19devv1alpha1.RebootPod) gauravkr19devv1alpha1.VaultSync {
+	log := log.FromContext(ctx)
+
+	// Fetch the latest version of RebootPod before updating status
+	// var latestRebootPod gauravkr19devv1alpha1.RebootPod
+	// if err := r.Get(ctx, types.NamespacedName{Name: rebootPod.Name, Namespace: rebootPod.Namespace}, &latestRebootPod); err != nil {
+	// 	log.Error(err, "Failed to fetch latest RebootPod for status update")
+	// 	// return err
+	// }
+
+	_, _, username, password, err := r.fetchTTLFromVault(ctx, rebootPod.Name, rebootPod.Namespace)
+	if err != nil {
+		log.Error(err, "Failed to fetch Vault credentials")
+		// return
+	}
+
+	secretName, err := r.vaultSyncStatus(ctx, rebootPod, username, password)
+	if err != nil {
+		rebootPod.Status.VaultSyncStatus = gauravkr19devv1alpha1.VaultSync{
+			State: "Failure",
+			SynchedSecret: []corev1.ObjectReference{
+				{Name: "NoMatchingSecret", Namespace: rebootPod.Namespace},
+			},
+		}
+	} else {
+		rebootPod.Status.VaultSyncStatus = gauravkr19devv1alpha1.VaultSync{
+			State: "Success",
+			SynchedSecret: []corev1.ObjectReference{
+				{Name: secretName, Namespace: rebootPod.Namespace},
+			},
+		}
+	}
+
+	// if err := r.Status().Update(ctx, rebootPod); err != nil {
+	// 	log.Error(err, "Failed to update Vault sync status")
+	// }
+
+	log.V(2).Info("Fetched Vault sync status and secret name", "secretName", secretName, "namespace", rebootPod.Namespace)
+	return rebootPod.Status.VaultSyncStatus
+}
+
 // It compares the username/password with the k8s secret
 func (r *RebootPodReconciler) vaultSyncStatus(ctx context.Context, rebootPod *gauravkr19devv1alpha1.RebootPod, username, password string) (string, error) {
 	log := log.FromContext(ctx)
@@ -997,16 +1101,19 @@ func (r *RebootPodReconciler) vaultSyncStatus(ctx context.Context, rebootPod *ga
 
 	// No secret found with vault creds
 	if matchingSecretName == "" {
-		log.Info("No matching Secret found with Vault credentials")
+		log.V(1).Info("Sync issue, Vault secret is not in sync with k8s secret", "namespace", rebootPod.Namespace)
 		return "", fmt.Errorf("no matching Secret found")
 	}
 
-	// log.Info("Matching Secret found", "SecretName", matchingSecretName)
+	log.V(2).Info("Matching Secret found", "SecretName", matchingSecretName, "namespace", rebootPod.Namespace)
 	return matchingSecretName, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *RebootPodReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// Initialize the health check queue
+	r.SetupHealthCheckQueue()
+
 	// Start the Work Queue & Polling in a separate goroutine
 	go func() {
 		if err := r.Start(context.Background()); err != nil {
