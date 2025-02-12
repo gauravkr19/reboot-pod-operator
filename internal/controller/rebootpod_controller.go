@@ -112,13 +112,6 @@ func NewRebootPodReconciler(client client.Client, dynamicClient dynamic.Interfac
 	}, nil
 }
 
-// // ANSI escape codes for colors and reset
-// const (
-// 	Reset = "\033[0m"
-// 	Bold  = "\033[1m"
-// 	Blue  = "\033[34m" // Or any color code of your choice
-// )
-
 // +kubebuilder:rbac:groups=gauravkr19.dev,resources=rebootpods,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=gauravkr19.dev,resources=rebootpods/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=gauravkr19.dev,resources=rebootpods/finalizers,verbs=update
@@ -126,6 +119,7 @@ func NewRebootPodReconciler(client client.Client, dynamicClient dynamic.Interfac
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -238,8 +232,8 @@ func (r *RebootPodReconciler) fetchTTLFromVault(ctx context.Context, name, names
 	vaultEndpointDB := rebootPod.Spec.VaultEndpointDB
 	AuthPath := os.Getenv("AuthPath")
 
-	jwtToken, err := os.ReadFile("/home/cloud_user/my-controller/unseal/jwt_token")
-	// jwtToken, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
+	// jwtToken, err := os.ReadFile("/home/cloud_user/my-controller/unseal/jwt_token")
+	jwtToken, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
 	if err != nil {
 		log.Error(err, "unable to read ServiceAccount JWT token")
 	}
@@ -409,7 +403,7 @@ func (r *RebootPodReconciler) getResourceEventHandler(namespace string, restartT
 
 			// Check if the ResourceVersion is already processed
 			if lastRV, ok := r.ProcessedResourceVersions.Load(key); ok && lastRV == newRV {
-				// log.Log.V(2).Info("Skipping event: ResourceVersion unchanged", "Name", newU.GetName(), "Namespace", newU.GetNamespace(), "ResourceVersion", newRV)
+				log.Log.V(2).Info("Skipping event: ResourceVersion not changed", "Name", newU.GetName(), "Namespace", newU.GetNamespace(), "ResourceVersion", newRV)
 				return
 			}
 
@@ -953,12 +947,15 @@ func (r *RebootPodReconciler) updateRebootPodStatus(ctx context.Context, namespa
 	return nil
 }
 
-// Check if the TTL might have expired based on last known rotation and current time
+// Helper func to determine rollou-restart
 func ttlExpired(lastRotation time.Time) bool {
-	// TTL expiry missed by 4s, consider it expired
-	expirationBuffer := 10 * time.Second
+	// Extend lastRotation by 10 seconds
+	lastRotation = lastRotation.Add(10 * time.Second)
+
+	// The pod can restart anytime from lastRotation (extended by 10s) until next 20 seconds,
+	// thereby, consuming stale DB password for upto 30s
+	expirationBuffer := 20 * time.Second
 	now := time.Now()
-	// lastRotationExtended := lastRotation.Add(30 * time.Second)
 	// Check if the difference between now and the last known rotation time indicates expiration
 	return now.Sub(lastRotation) < expirationBuffer
 }
@@ -1038,13 +1035,6 @@ func (r *RebootPodReconciler) StartPollingLoop(ctx context.Context) {
 func (r *RebootPodReconciler) updateVaultSyncStatus(ctx context.Context, rebootPod *gauravkr19devv1alpha1.RebootPod) gauravkr19devv1alpha1.VaultSync {
 	log := log.FromContext(ctx)
 
-	// Fetch the latest version of RebootPod before updating status
-	// var latestRebootPod gauravkr19devv1alpha1.RebootPod
-	// if err := r.Get(ctx, types.NamespacedName{Name: rebootPod.Name, Namespace: rebootPod.Namespace}, &latestRebootPod); err != nil {
-	// 	log.Error(err, "Failed to fetch latest RebootPod for status update")
-	// 	// return err
-	// }
-
 	_, _, username, password, err := r.fetchTTLFromVault(ctx, rebootPod.Name, rebootPod.Namespace)
 	if err != nil {
 		log.Error(err, "Failed to fetch Vault credentials")
@@ -1067,10 +1057,6 @@ func (r *RebootPodReconciler) updateVaultSyncStatus(ctx context.Context, rebootP
 			},
 		}
 	}
-
-	// if err := r.Status().Update(ctx, rebootPod); err != nil {
-	// 	log.Error(err, "Failed to update Vault sync status")
-	// }
 
 	log.V(2).Info("Fetched Vault sync status and secret name", "secretName", secretName, "namespace", rebootPod.Namespace)
 	return rebootPod.Status.VaultSyncStatus
