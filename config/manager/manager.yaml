@@ -76,6 +76,10 @@ spec:
           value: "/tmp/ca.crt"
         - name: ReportingCRs
           value: "false"
+        - name: LOG_LEVEL_DEBUG
+          value: "false"
+        - name: VERBOSE_LEVEL
+          value: "1"
         securityContext:
           allowPrivilegeEscalation: false
           capabilities:

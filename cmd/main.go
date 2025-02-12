@@ -21,10 +21,12 @@ import (
 	"flag"
 	"log"
 	"os"
+	"strconv"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
 
+	"go.uber.org/zap/zapcore"
 	"k8s.io/client-go/dynamic"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
@@ -57,10 +59,6 @@ func init() {
 }
 
 func main() {
-	// vaultURL := os.Getenv("VAULT_URL")
-	// authPath := os.Getenv("VAULT_AUTH_PATH")
-	// useTLS := os.Getenv("USE_TLS") == "false"
-
 	var metricsAddr string
 	var enableLeaderElection bool
 	var probeAddr string
@@ -77,12 +75,27 @@ func main() {
 		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+
+	logLevelDebug, _ := strconv.ParseBool(os.Getenv("LOG_LEVEL_DEBUG")) // pass true or false as env
+	verbosityLevel, _ := strconv.Atoi(os.Getenv("VERBOSE_LEVEL"))       // pass int as 0, 1, or 2
+
 	opts := zap.Options{
-		Development: true,
+		Development: logLevelDebug,
 	}
-	opts.BindFlags(flag.CommandLine)
+
+	// Set verbosity level for logr
+	switch verbosityLevel {
+	case 2:
+		opts.Level = zapcore.Level(-2) // Enable log.Info(), log.V(1).Info(), and log.V(2).Info()
+	case 1:
+		opts.Level = zapcore.Level(-1) // Enable log.Info() and log.V(1).Info(), but suppress log.V(2).Info()
+	default:
+		opts.Level = zapcore.Level(0) // Enable only log.Info()
+	}
+
 	flag.Parse()
 
+	opts.BindFlags(flag.CommandLine)
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
