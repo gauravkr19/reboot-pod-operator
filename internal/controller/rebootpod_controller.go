@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -31,7 +32,7 @@ import (
 	vault "github.com/hashicorp/vault/api"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -103,8 +104,8 @@ func NewRebootPodReconciler(client client.Client, dynamicClient dynamic.Interfac
 		DynamicClient:    dynamicClient,
 		Scheme:           scheme,
 		Cache:            make(map[string]TTLCacheEntry),
-		Queue:            workqueue.NewTypedRateLimitingQueue[types.NamespacedName](workqueue.DefaultTypedControllerRateLimiter[types.NamespacedName]()),
-		HealthCheckQueue: workqueue.NewTypedRateLimitingQueue[HealthCheckItem](workqueue.DefaultTypedControllerRateLimiter[HealthCheckItem]()),
+		Queue:            workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[types.NamespacedName]()),
+		HealthCheckQueue: workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[HealthCheckItem]()),
 		VaultURL:         vaultURL,
 		AuthPath:         authPath,
 		UseTLS:           useTLS,
@@ -143,7 +144,7 @@ func (r *RebootPodReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	// Fetch the RebootPod instance
 	var rebootPod gauravkr19devv1alpha1.RebootPod
 	if err := r.Get(ctx, req.NamespacedName, &rebootPod); err != nil {
-		if errors.IsNotFound(err) {
+		if k8serrors.IsNotFound(err) {
 			log.Info("RebootPod resource not found. Ignoring since it must be deleted.")
 			return ctrl.Result{}, nil
 		}
@@ -232,8 +233,8 @@ func (r *RebootPodReconciler) fetchTTLFromVault(ctx context.Context, name, names
 	vaultEndpointDB := rebootPod.Spec.VaultEndpointDB
 	AuthPath := os.Getenv("AuthPath")
 
-	// jwtToken, err := os.ReadFile("/home/cloud_user/my-controller/unseal/jwt_token")
-	jwtToken, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
+	jwtToken, err := os.ReadFile("/home/cloud_user/projects/unseal/jwt_token")
+	// jwtToken, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
 	if err != nil {
 		log.Error(err, "unable to read ServiceAccount JWT token")
 	}
@@ -282,7 +283,7 @@ func (r *RebootPodReconciler) handleRollout(ctx context.Context, name string, na
 
 	// Retrieve the latest RebootPod object
 	if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, &rebootPod); err != nil {
-		if errors.IsNotFound(err) {
+		if k8serrors.IsNotFound(err) {
 			log.Info("RebootPod not found, may have been deleted", "name", name, "namespace", namespace)
 			return nil
 		}
@@ -299,10 +300,10 @@ func (r *RebootPodReconciler) handleRollout(ctx context.Context, name string, na
 				log.Error(err, "Deployment not found", "name", target.Name, "namespace", rebootPod.Namespace)
 				continue
 			}
-			if err := r.annotateAndRestartDeployment(ctx, &deployment); err != nil {
-				return err
-			}
-			log.Info("Rollout-Restart of Deployment complete", "deployment", target.Name, "namespace", rebootPod.Namespace)
+			// if err := r.annotateAndRestartDeployment(ctx, &deployment); err != nil {
+			// 	return err
+			// }
+			// log.Info("Rollout-Restart of Deployment complete", "deployment", target.Name, "namespace", rebootPod.Namespace)
 
 		case "StatefulSet":
 			var statefulSet appsv1.StatefulSet
@@ -310,10 +311,10 @@ func (r *RebootPodReconciler) handleRollout(ctx context.Context, name string, na
 				log.Error(err, "StatefulSet not found", "name", target.Name, "namespace", rebootPod.Namespace)
 				continue
 			}
-			if err := r.annotateAndRestartStatefulSet(ctx, &statefulSet); err != nil {
-				return err
-			}
-			log.Info("Rollout-Restart of StatefulSet complete", "statefulset", target.Name, "namespace", rebootPod.Namespace)
+			// if err := r.annotateAndRestartStatefulSet(ctx, &statefulSet); err != nil {
+			// 	return err
+			// }
+			// log.Info("Rollout-Restart of StatefulSet complete", "statefulset", target.Name, "namespace", rebootPod.Namespace)
 		}
 	}
 	// Cache update after a successful restart or status check
@@ -329,21 +330,21 @@ func (r *RebootPodReconciler) handleRollout(ctx context.Context, name string, na
 }
 
 // Separate functions for annotating and restarting
-func (r *RebootPodReconciler) annotateAndRestartDeployment(ctx context.Context, deployment *appsv1.Deployment) error {
-	if deployment.Spec.Template.Annotations == nil {
-		deployment.Spec.Template.Annotations = make(map[string]string)
-	}
-	deployment.Spec.Template.Annotations["kubectl.kubernetes.io/restartedAt"] = time.Now().Format(time.RFC3339)
-	return r.Update(ctx, deployment)
-}
+// func (r *RebootPodReconciler) annotateAndRestartDeployment(ctx context.Context, deployment *appsv1.Deployment) error {
+// 	if deployment.Spec.Template.Annotations == nil {
+// 		deployment.Spec.Template.Annotations = make(map[string]string)
+// 	}
+// 	deployment.Spec.Template.Annotations["kubectl.kubernetes.io/restartedAt"] = time.Now().Format(time.RFC3339)
+// 	return r.Update(ctx, deployment)
+// }
 
-func (r *RebootPodReconciler) annotateAndRestartStatefulSet(ctx context.Context, statefulSet *appsv1.StatefulSet) error {
-	if statefulSet.Spec.Template.Annotations == nil {
-		statefulSet.Spec.Template.Annotations = make(map[string]string)
-	}
-	statefulSet.Spec.Template.Annotations["kubectl.kubernetes.io/restartedAt"] = time.Now().Format(time.RFC3339)
-	return r.Update(ctx, statefulSet)
-}
+// func (r *RebootPodReconciler) annotateAndRestartStatefulSet(ctx context.Context, statefulSet *appsv1.StatefulSet) error {
+// 	if statefulSet.Spec.Template.Annotations == nil {
+// 		statefulSet.Spec.Template.Annotations = make(map[string]string)
+// 	}
+// 	statefulSet.Spec.Template.Annotations["kubectl.kubernetes.io/restartedAt"] = time.Now().Format(time.RFC3339)
+// 	return r.Update(ctx, statefulSet)
+// }
 
 // getRestartTargets converts rebootPod.Spec.RestartTargets into []corev1.ObjectReference type
 func (r *RebootPodReconciler) getRestartTargets(rebootPod *gauravkr19devv1alpha1.RebootPod) []corev1.ObjectReference {
@@ -705,18 +706,18 @@ func (r *RebootPodReconciler) processHealthCheckQueue(ctx context.Context, item 
 		})
 
 		if err := r.Get(ctx, workloadKey, workload); err != nil {
-			if errors.IsNotFound(err) {
-				log.Error(err, fmt.Sprintf("%s not found", workloadKind), "name", target.Name)
+			if k8serrors.IsNotFound(err) {
+				log.Error(err, fmt.Sprintf("%s not found", workloadKind), "name", target.Name, "namespace", item.WorkloadKey.Namespace)
 				continue
 			}
-			log.Error(err, fmt.Sprintf("Failed to fetch %s", workloadKind), "name", target.Name)
+			log.Error(err, fmt.Sprintf("Failed to fetch %s", workloadKind), "name", target.Name, "namespace", item.WorkloadKey.Namespace)
 			continue
 		}
 
 		// Fetch warnings
 		warnings, err := r.logResourceWarnings(ctx, target.Name, item.WorkloadKey.Namespace, workloadKind)
 		if err != nil {
-			log.Error(err, fmt.Sprintf("Failed to fetch warnings for %s", workloadKind), "name", target.Name)
+			log.Error(err, fmt.Sprintf("Failed to fetch warnings for %s", workloadKind), "name", target.Name, "namespace", item.WorkloadKey.Namespace)
 		}
 
 		for _, warning := range warnings {
@@ -886,7 +887,8 @@ func (r *RebootPodReconciler) checkWorkloadStatus(ctx context.Context, workloadT
 
 	if len(failureMessages) > 0 {
 		log.V(1).Info("Deployment health check failed", "deployment", workload.GetName(), "namespace", workload.GetNamespace(), "errors", strings.Join(failureMessages, "; "))
-		return strings.Join(failureMessages, "; "), fmt.Errorf(strings.Join(failureMessages, "; "))
+		// return strings.Join(failureMessages, "; "), fmt.Errorf(strings.Join(failureMessages, "; "))
+		return strings.Join(failureMessages, "; "), errors.New(strings.Join(failureMessages, "; "))
 	}
 
 	log.V(2).Info(fmt.Sprintf("%s health check is complete", workloadType), "workload", workload.GetName(), "namespace", workload.GetNamespace())
